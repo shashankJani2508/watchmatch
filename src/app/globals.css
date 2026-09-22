@@ -1,0 +1,61 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+* {
+  -webkit-tap-highlight-color: transparent;
+}
+
+html, body {
+  background: #0d0d18;
+  color: #ffffff;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Prevent pull-to-refresh on swipe page */
+body.no-overscroll {
+  overscroll-behavior: none;
+}
+
+::-webkit-scrollbar { width: 3px; }
+::-webkit-scrollbar-track { background: #1c1c2e; }
+::-webkit-scrollbar-thumb { background: #7c3aed; border-radius: 2px; }
+
+/* Chip toggle */
+.h-dvh {
+  height: 100vh;      /* fallback for older browsers */
+  height: 100dvh;     /* excludes mobile browser chrome */
+}
+
+.chip {
+  @apply px-4 py-2 rounded-full border text-sm font-medium cursor-pointer transition-all duration-150 select-none;
+  border-color: #3a3a5c;
+  color: #a0aec0;
+  background: transparent;
+}
+
+.chip.selected {
+  background: #7c3aed;
+  border-color: #7c3aed;
+  color: #fff;
+}
+
+.chip:active {
+  transform: scale(0.95);
+}
+
+/* Glow effect for match */
+@keyframes glow-pulse {
+  0%, 100% { box-shadow: 0 0 20px rgba(124, 58, 237, 0.4); }
+  50% { box-shadow: 0 0 40px rgba(124, 58, 237, 0.8), 0 0 60px rgba(124, 58, 237, 0.3); }
+}
+
+.glow { animation: glow-pulse 2s ease-in-out infinite; }
+
+/* Card drag cursor */
+.swipe-card { cursor: grab; }
+.swipe-card:active { cursor: grabbing; }

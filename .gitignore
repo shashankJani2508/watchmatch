@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Build output
+.next/
+out/
+build/
+
+# Secrets — match every .env variant, keep only the placeholder template.
+# A narrow list misses files like .env.vercel, which holds live DB passwords.
+.env
+.env.*
+!.env.example
+
+# Vercel
+.vercel
+
+# Stale duplicate copy of the project, not part of the build
+/watchmatch/
+
+# Logs and OS cruft
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+tsconfig.tsbuildinfo
