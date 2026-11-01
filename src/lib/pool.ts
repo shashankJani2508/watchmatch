@@ -1,4 +1,5 @@
 import { Preferences, Title, ERA_BOUNDS } from '../types'
+import type { SearchBrief } from './gemini'
 
 // A deck this small is still better than one that ignores what the users chose.
 const MIN_USABLE = 1
@@ -53,10 +54,18 @@ export async function buildPool(
     const { generateSearchBrief, generateRound2Brief } = await import('./gemini')
     const { fetchTitlePool } = await import('./tmdb')
 
-    const brief =
-      round === 1
-        ? await generateSearchBrief(prefA, prefB)
-        : { ...(await generateRound2Brief(prefA, prefB, 0, 0, 0)), notes: '' }
+    // The brief is only a hint (sort order, and genres when nobody picked any).
+    // If Gemini is down, out of quota, or the key has expired, carry on with
+    // TMDB rather than throwing away the whole deck.
+    let brief: SearchBrief = { genres: [], sortBy: 'vote_average.desc', notes: '' }
+    try {
+      brief =
+        round === 1
+          ? await generateSearchBrief(prefA, prefB)
+          : { ...(await generateRound2Brief(prefA, prefB, 0, 0, 0)), notes: '' }
+    } catch (e) {
+      console.error('[WatchMatch] Gemini brief failed, continuing without it:', e)
+    }
 
     const pools = await fetchTitlePool(prefA, prefB, brief, seenIds, round)
     if (pools.poolA.length >= MIN_USABLE && pools.poolB.length >= MIN_USABLE) return pools

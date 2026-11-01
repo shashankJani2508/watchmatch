@@ -48,7 +48,9 @@ function getSql(): NeonQueryFunction<false, true> {
   if (g._wmSql) return g._wmSql
   const connStr = process.env.POSTGRES_URL_NON_POOLING ?? process.env.POSTGRES_URL
   if (!connStr) throw new Error('No Postgres connection string')
-  g._wmSql = neon(connStr, { fullResults: true })
+  // Next.js patches fetch and can serve a cached response; the HTTP driver is
+  // built on fetch, so without no-store a read can return stale session state.
+  g._wmSql = neon(connStr, { fullResults: true, fetchOptions: { cache: 'no-store' } })
   return g._wmSql
 }
 
@@ -113,28 +115,106 @@ export const store = {
     return memSessions.get(id) ?? null
   },
 
-  async updateSession(id: string, patch: Partial<StoredSession>): Promise<StoredSession | null> {
+  // Atomic top-level merge. A read-modify-write here lets two partners who
+  // submit at the same moment overwrite each other's preferences.
+  async mergeSession(id: string, patch: Partial<StoredSession>): Promise<StoredSession | null> {
     if (hasPostgres()) {
       const sql = getSql()
-      const selectResult = await sql`SELECT data FROM wm_sessions WHERE id = ${id}::uuid`
-      if (selectResult.rows.length === 0) return null
-      const current = selectResult.rows[0].data as StoredSession
-      const updated = { ...current, ...patch, updated_at: now() }
-      const updateResult = await sql`
+      const stamped = JSON.stringify({ ...patch, updated_at: now() })
+      const r = await sql`
         UPDATE wm_sessions
-        SET data = ${JSON.stringify(updated)}::jsonb, updated_at = now()
+        SET data = data || ${stamped}::jsonb, updated_at = now()
         WHERE id = ${id}::uuid
+        RETURNING data
       `
-      if (updateResult.rowCount === 0) {
-        console.error('[store] UPDATE affected 0 rows for session', id)
-      }
-      return updated
+      return r.rows.length > 0 ? (r.rows[0].data as StoredSession) : null
     }
     const s = memSessions.get(id)
     if (!s) return null
     const updated = { ...s, ...patch, updated_at: now() }
     memSessions.set(id, updated)
     return updated
+  },
+
+  async updateSession(id: string, patch: Partial<StoredSession>): Promise<StoredSession | null> {
+    return store.mergeSession(id, patch)
+  },
+
+  // Apply a patch only if the session is currently in one of the `from` states
+  // (and, optionally, in a given round). Returns null when the guard fails, so
+  // exactly one of several racing requests wins a state change.
+  async transition(
+    id: string,
+    from: SessionStatus[],
+    patch: Partial<StoredSession>,
+    opts?: { round?: number }
+  ): Promise<StoredSession | null> {
+    if (hasPostgres()) {
+      const sql = getSql()
+      const stamped = JSON.stringify({ ...patch, updated_at: now() })
+      const allowed = JSON.stringify(from)
+      const r = opts?.round !== undefined
+        ? await sql`
+            UPDATE wm_sessions
+            SET data = data || ${stamped}::jsonb, updated_at = now()
+            WHERE id = ${id}::uuid
+              AND data->>'status' IN (SELECT jsonb_array_elements_text(${allowed}::jsonb))
+              AND (data->>'round')::int = ${opts.round}
+            RETURNING data
+          `
+        : await sql`
+            UPDATE wm_sessions
+            SET data = data || ${stamped}::jsonb, updated_at = now()
+            WHERE id = ${id}::uuid
+              AND data->>'status' IN (SELECT jsonb_array_elements_text(${allowed}::jsonb))
+            RETURNING data
+          `
+      return r.rows.length > 0 ? (r.rows[0].data as StoredSession) : null
+    }
+    const s = memSessions.get(id)
+    if (!s || !from.includes(s.status)) return null
+    if (opts?.round !== undefined && s.round !== opts.round) return null
+    const updated = { ...s, ...patch, updated_at: now() }
+    memSessions.set(id, updated)
+    return updated
+  },
+
+  // Just the fields the polling endpoint needs, so a poll doesn't pull both
+  // decks (tens of KB) out of the database every couple of seconds.
+  async getSessionStatus(id: string): Promise<{
+    status: SessionStatus
+    round: number
+    matched_tmdb_id: number | null
+    matched_type: 'movie' | 'tv' | null
+  } | null> {
+    if (hasPostgres()) {
+      const sql = getSql()
+      const r = await sql`
+        SELECT data->>'status' AS status,
+               COALESCE((data->>'round')::int, 1) AS round,
+               (data->>'matched_tmdb_id')::int AS matched_tmdb_id,
+               data->>'matched_type' AS matched_type
+        FROM wm_sessions WHERE id = ${id}::uuid
+      `
+      if (r.rows.length === 0) return null
+      const row = r.rows[0]
+      return {
+        status: row.status as SessionStatus,
+        round: row.round as number,
+        matched_tmdb_id: (row.matched_tmdb_id as number | null) ?? null,
+        matched_type: (row.matched_type as 'movie' | 'tv' | null) ?? null,
+      }
+    }
+    const s = memSessions.get(id)
+    return s
+      ? { status: s.status, round: s.round, matched_tmdb_id: s.matched_tmdb_id, matched_type: s.matched_type }
+      : null
+  },
+
+  async ping(): Promise<void> {
+    if (hasPostgres()) {
+      await getSql()`SELECT 1`
+    }
   },
 
   async addSwipe(swipe: Omit<StoredSwipe, 'id'>): Promise<StoredSwipe> {
@@ -178,6 +258,28 @@ export const store = {
     return memSwipes.filter(
       s => s.session_id === sessionId && s.partner === partner && s.round === round
     ).length
+  },
+
+  async countSwipesByPartner(sessionId: string, round: number): Promise<{ a: number; b: number }> {
+    if (hasPostgres()) {
+      const sql = getSql()
+      const r = await sql`
+        SELECT partner, COUNT(*)::int AS count FROM wm_swipes
+        WHERE session_id = ${sessionId}::uuid AND round = ${round}
+        GROUP BY partner
+      `
+      const out = { a: 0, b: 0 }
+      for (const row of r.rows) {
+        const p = String(row.partner).trim()
+        if (p === 'a' || p === 'b') out[p] = row.count as number
+      }
+      return out
+    }
+    const mine = memSwipes.filter(x => x.session_id === sessionId && x.round === round)
+    return {
+      a: mine.filter(x => x.partner === 'a').length,
+      b: mine.filter(x => x.partner === 'b').length,
+    }
   },
 
   async findMatchingSwipe(

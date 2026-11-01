@@ -1,10 +1,9 @@
 import { NextResponse } from 'next/server'
+import { useSupabase } from '@/lib/db-provider'
 
 // Never cache: these read and write live session state.
 export const dynamic = 'force-dynamic'
 
-const useSupabase = () =>
-  !!(process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
 
 export async function POST() {
   if (useSupabase()) {

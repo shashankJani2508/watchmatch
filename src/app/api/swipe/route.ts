@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { Partner, SessionRow, rowToSession, DECK_SIZE, MIN_ROUND_DECK } from '@/types'
+import { useSupabase } from '@/lib/db-provider'
 
 // Never cache: these read and write live session state.
 export const dynamic = 'force-dynamic'
@@ -7,8 +8,6 @@ export const dynamic = 'force-dynamic'
 // Round 2 builds its pool inside this request.
 export const maxDuration = 60
 
-const useSupabase = () =>
-  !!(process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
 
 interface SwipeBody {
   sessionId: string
@@ -31,82 +30,89 @@ export async function POST(req: NextRequest) {
     return handleSupabase(sessionId, partner, tmdbId, titleType, liked, round,
       isFinal, deckFinished, body.deckSize, body.poolLength)
   }
-  return handleStore(sessionId, partner, tmdbId, titleType, liked, round)
+  return handleStore(sessionId, partner, tmdbId, titleType, liked, round,
+    isFinal, deckFinished, body.deckSize, body.poolLength)
 }
+
+type StoreT = typeof import('@/lib/store').store
 
 async function handleStore(
   sessionId: string, partner: Partner, tmdbId: number,
-  titleType: 'movie' | 'tv', liked: boolean, round: number
+  titleType: 'movie' | 'tv', liked: boolean, round: number,
+  isFinal?: boolean, deckFinished?: boolean, deckSize?: number, poolLength?: number
 ) {
   const { store } = await import('@/lib/store')
+  const other: Partner = partner === 'a' ? 'b' : 'a'
 
-  await store.addSwipe({ session_id: sessionId, partner, tmdb_id: tmdbId, title_type: titleType, liked, round })
+  // A deckFinished ping records nothing; it only asks for the round-end check.
+  if (deckFinished) return storeRoundEnd(store, sessionId, round, deckSize, poolLength)
+
+  // Record the swipe first, then look for the other partner's like. Running the
+  // two together would let two simultaneous likes each miss the other.
+  await store.addSwipe({
+    session_id: sessionId, partner, tmdb_id: tmdbId, title_type: titleType, liked, round,
+  })
 
   if (liked) {
-    const other: Partner = partner === 'a' ? 'b' : 'a'
-    const match = await store.findMatchingSwipe(sessionId, tmdbId, titleType, other)
-    if (match) {
-      await store.updateSession(sessionId, { status: 'matched', matched_tmdb_id: tmdbId, matched_type: titleType })
+    const hit = await store.findMatchingSwipe(sessionId, tmdbId, titleType, other)
+    if (hit) {
+      await store.transition(sessionId, ['swiping', 'round2'], {
+        status: 'matched', matched_tmdb_id: tmdbId, matched_type: titleType,
+      })
       return NextResponse.json({ match: true, tmdbId, titleType })
     }
   }
 
-  const session = await store.getSession(sessionId)
-  if (!session) return NextResponse.json({ match: false })
-
-  const pool = partner === 'a' ? session.pool_a : session.pool_b
-  const myCount = await store.countSwipes(sessionId, partner, session.round)
-
-  if (myCount >= pool.length) {
-    const other: Partner = partner === 'a' ? 'b' : 'a'
-    const otherPool = other === 'a' ? session.pool_a : session.pool_b
-    const otherCount = await store.countSwipes(sessionId, other, session.round)
-
-    if (otherCount >= otherPool.length) {
-      await handleRoundEnd(sessionId, session, store)
-    }
-  }
-
-  return NextResponse.json({ match: false })
+  // Only the last card of a deck can end a round.
+  if (!isFinal) return NextResponse.json({ match: false })
+  return storeRoundEnd(store, sessionId, round, deckSize, poolLength)
 }
 
-async function handleRoundEnd(sessionId: string, session: any, store: any) {
-  if (session.round === 1) {
-    await store.updateSession(sessionId, { status: 'generating', round: 2 })
-    try {
-      let poolA, poolB
-      if (!process.env.GEMINI_API_KEY || !process.env.TMDB_API_READ_ACCESS_TOKEN) {
-        const { getDemoPool } = await import('@/lib/tmdb')
-        const demo = getDemoPool()
-        poolA = demo.poolA
-        poolB = demo.poolB
-      } else {
-        const { generateRound2Brief } = await import('@/lib/gemini')
-        const { fetchTitlePool } = await import('@/lib/tmdb')
-        const allSwipes = await store.getSwipes(sessionId, 1)
-        const aLiked = allSwipes.filter((s: any) => s.partner === 'a' && s.liked).length
-        const bLiked = allSwipes.filter((s: any) => s.partner === 'b' && s.liked).length
-        const brief = await generateRound2Brief(
-          session.partner_a_preferences, session.partner_b_preferences, aLiked, bLiked, 0
-        )
-        const result = await fetchTitlePool(
-          session.partner_a_preferences, session.partner_b_preferences,
-          { ...brief, notes: '' }, session.seen_tmdb_ids, 2
-        )
-        poolA = result.poolA
-        poolB = result.poolB
-      }
-      const newIds = Array.from(new Set([...poolA, ...poolB].map((t: any) => t.tmdbId)))
-      await store.updateSession(sessionId, {
-        status: 'round2', pool_a: poolA, pool_b: poolB,
-        seen_tmdb_ids: [...session.seen_tmdb_ids, ...newIds],
-      })
-    } catch (e) {
-      console.error('Round 2 gen failed:', e)
+async function storeRoundEnd(
+  store: StoreT, sessionId: string,
+  round?: number, deckSize?: number, poolLength?: number
+) {
+  let currentRound = round ?? 1
+  let deckA = deckSize ?? 0
+  let deckB = deckSize ?? 0
+  let pool = poolLength ?? 0
+
+  // The caller normally supplies its deck size and pool length. Without them,
+  // measure them from the stored session.
+  if (!(round && deckSize && poolLength)) {
+    const session = await store.getSession(sessionId)
+    if (!session) return NextResponse.json({ match: false })
+    if (session.status !== 'swiping' && session.status !== 'round2') {
+      return NextResponse.json({ match: false })
     }
-  } else {
-    await store.updateSession(sessionId, { status: 'top5' })
+    currentRound = session.round
+    const slice = (list: unknown[]) =>
+      list.slice((currentRound - 1) * DECK_SIZE, currentRound * DECK_SIZE).length
+    deckA = slice(session.pool_a)
+    deckB = slice(session.pool_b)
+    pool = Math.min(session.pool_a.length, session.pool_b.length)
   }
+
+  const counts = await store.countSwipesByPartner(sessionId, currentRound)
+  if (counts.a < deckA || counts.b < deckB) return NextResponse.json({ match: false })
+
+  const nextRound = currentRound + 1
+  // Round 2 is already sitting in the pool, so advancing is a single status
+  // change — nothing is generated or fetched.
+  const nextReady = pool - (nextRound - 1) * DECK_SIZE >= MIN_ROUND_DECK
+
+  await store.transition(
+    sessionId,
+    ['swiping', 'round2'],
+    nextReady ? { status: 'round2', round: nextRound } : { status: 'top5' },
+    { round: currentRound }
+  )
+
+  return NextResponse.json({
+    match: false,
+    status: nextReady ? 'round2' : 'top5',
+    round: nextReady ? nextRound : currentRound,
+  })
 }
 
 async function handleSupabase(

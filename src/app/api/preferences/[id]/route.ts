@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { Preferences, Partner, SessionRow, rowToSession } from '@/types'
+import { useSupabase } from '@/lib/db-provider'
 
 // Never cache: these read and write live session state.
 export const dynamic = 'force-dynamic'
@@ -8,8 +9,6 @@ export const dynamic = 'force-dynamic'
 // once it responds, so fire-and-forget work never finishes in production.
 export const maxDuration = 60
 
-const useSupabase = () =>
-  !!(process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
 
 export async function POST(
   req: NextRequest,
@@ -26,31 +25,36 @@ export async function POST(
 
 async function handleStore(id: string, partner: Partner, preferences: Preferences) {
   const { store } = await import('@/lib/store')
-  const current = await store.getSession(id)
-  if (!current) return NextResponse.json({ error: 'Session not found' }, { status: 404 })
+  const key = partner === 'a' ? 'partner_a_preferences' : 'partner_b_preferences'
 
-  const otherHasSubmitted =
-    partner === 'a' ? !!current.partner_b_preferences : !!current.partner_a_preferences
+  // Write only this partner's field, atomically. If both partners submit at the
+  // same moment, a read-then-write would let one overwrite the other.
+  const written = await store.mergeSession(id, { [key]: preferences })
+  if (!written) return NextResponse.json({ error: 'Session not found' }, { status: 404 })
 
-  const patch: Record<string, unknown> = {
-    [`partner_${partner}_preferences`]: preferences,
+  const bothDone = !!written.partner_a_preferences && !!written.partner_b_preferences
+
+  if (!bothDone) {
+    if (partner === 'a') {
+      const moved = await store.transition(id, ['waiting_b'], { status: 'a_submitted' })
+      return NextResponse.json({ status: (moved ?? written).status })
+    }
+    return NextResponse.json({ status: written.status })
   }
 
-  if (otherHasSubmitted && current.status !== 'generating' && current.status !== 'swiping') {
-    patch.status = 'generating'
-  } else if (!otherHasSubmitted && partner === 'a' && current.status === 'waiting_b') {
-    patch.status = 'a_submitted'
+  // Both are in. The later of the two writes sees both sets of preferences, and
+  // only one request can win this claim, so the deck is built exactly once.
+  const claimed = await store.transition(id, ['waiting_b', 'a_submitted'], { status: 'generating' })
+  if (!claimed) return NextResponse.json({ status: written.status })
+
+  try {
+    await generatePool(id, written.partner_a_preferences!, written.partner_b_preferences!, store)
+  } catch (e) {
+    // Don't leave the session stranded in 'generating'; let a retry claim it again.
+    await store.transition(id, ['generating'], { status: 'a_submitted' })
+    throw e
   }
-
-  const updated = await store.updateSession(id, patch as any)
-  if (!updated) return NextResponse.json({ error: 'Update failed' }, { status: 500 })
-
-  if (updated.status === 'generating') {
-    await generatePool(id, updated.partner_a_preferences!, updated.partner_b_preferences!, store)
-    return NextResponse.json({ status: 'swiping' })
-  }
-
-  return NextResponse.json({ status: updated.status })
+  return NextResponse.json({ status: 'swiping' })
 }
 
 async function handleSupabase(id: string, partner: Partner, preferences: Preferences) {
@@ -101,7 +105,7 @@ async function generatePool(
       .update({ status: 'swiping', pool_a: poolA, pool_b: poolB, seen_tmdb_ids: allIds })
       .eq('id', sessionId).eq('status', 'generating')
   } else {
-    await dbOrStore.updateSession(sessionId, {
+    await dbOrStore.transition(sessionId, ['generating'], {
       status: 'swiping', pool_a: poolA, pool_b: poolB, seen_tmdb_ids: allIds,
     })
   }
